@@ -13,4 +13,10 @@ namespace MQTT_Publisher_OrigaDataTable
         public int Age { get; set; }
         public bool IsActive { get; set; }
     }
+    public class PersonUpdate
+    {
+        public int Id { get; set; }
+        public int Age { get; set; }
+        public bool IsActive { get; set; }
+    }
 }

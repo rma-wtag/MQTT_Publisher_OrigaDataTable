@@ -1,135 +1,181 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
+using MQTT_Publisher_OrigaDataTable;
 using MQTTnet;
 using MQTTnet.Client;
 
 class Program
 {
-    private class Person
-    {
-        public int Id { get; set; }
-        public string? FirstName { get; set; }
-        public string? LastName { get; set; }
-        public string? Email { get; set; }
-        public int Age { get; set; }
-        public bool IsActive { get; set; }
-    }
 
     private static IMqttClient? client;
-    private static volatile bool keepRunning = true;
+    private static volatile bool running = true;
+    private static readonly List<Person> people = new();
 
-    static async Task Main(string[] args)
+    static async Task Main()
     {
-        Console.WriteLine("Starting people data publisher...");
-        Console.WriteLine("Will send updates every ~5 seconds. Press Q to quit.\n");
+        Console.WriteLine("MQTT People Publisher");
+        Console.WriteLine("=====================");
+        Console.WriteLine("Sends 40 people initially, then updates age & status randomly\n");
 
         try
         {
-            await Connect();
+            await ConnectToBroker();
+            await SendInitialPeopleData();
+
+            _ = Task.Run(UpdateLoopAsync); // fire and forget background updates
+
+            Console.WriteLine("Commands:");
+            Console.WriteLine("  [any key] → send random update now");
+            Console.WriteLine("  q         → quit\n");
+
+            while (running)
+            {
+                if (Console.KeyAvailable)
+                {
+                    var key = Console.ReadKey(true);
+                    if (key.Key == ConsoleKey.Q)
+                    {
+                        running = false;
+                        Console.WriteLine("\nShutting down...");
+                    }
+                    else
+                    {
+                        Console.WriteLine("→ Manual update");
+                        await SendRandomUpdate();
+                    }
+                }
+
+                await Task.Delay(80);
+            }
+
+            await Task.Delay(300); // give some time for last updates to fly
+            await Cleanup();
+            Console.WriteLine("Goodbye 👋");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Couldn't connect: {ex.Message}");
-            return;
+            Console.WriteLine($"Something went wrong: {ex.Message}");
         }
-
-        var publishingTask = Task.Run(PublishLoop);
-
-        Console.WriteLine("Press any key to send data right now, Q to stop");
-
-        while (keepRunning)
-        {
-            if (Console.KeyAvailable)
-            {
-                var key = Console.ReadKey(intercept: true);
-                if (key.Key == ConsoleKey.Q)
-                {
-                    keepRunning = false;
-                    Console.WriteLine("\nStopping...");
-                }
-                else
-                {
-                    Console.WriteLine("→ Manual publish triggered");
-                    await SendData();
-                }
-            }
-
-            await Task.Delay(80); // small sleep so we don't hammer the CPU
-        }
-
-        await publishingTask;
-        await Cleanup();
-
-        Console.WriteLine("Done.");
     }
 
-    private static async Task Connect()
+    private static async Task ConnectToBroker()
     {
-        var factory = new MqttFactory();
-        client = factory.CreateMqttClient();
+        var mqttFactory = new MqttFactory();
+        client = mqttFactory.CreateMqttClient();
 
         var options = new MqttClientOptionsBuilder()
             .WithTcpServer("localhost", 1883)
-            .WithClientId("PeoplePub-" + Guid.NewGuid().ToString("N")[..8])
+            .WithClientId($"PeoplePub-{Guid.NewGuid().ToString("N")[..8]}")
             .WithCleanSession(true)
             .Build();
 
         await client.ConnectAsync(options);
-        Console.WriteLine("Connected to broker.");
+        Console.WriteLine("Connected to localhost:1883 ✓");
     }
 
-    private static async Task Cleanup()
+    private static async Task SendInitialPeopleData()
     {
-        if (client?.IsConnected == true)
+        Console.WriteLine("Preparing and sending initial 40 people...");
+
+        string[] firstNames = ["James", "Emma", "Liam", "Olivia", "Noah", "Ava", "Ethan", "Sophia",
+            "Lucas", "Mia", "Alexander", "Charlotte", "Benjamin", "Amelia", "William", "Harper",
+            "Michael", "Evelyn", "Daniel", "Abigail", "Henry", "Emily", "Jackson", "Elizabeth",
+            "Sebastian", "Sofia", "Jack", "Avery", "Owen", "Ella", "Theodore", "Scarlett",
+            "Aiden", "Grace", "Samuel", "Chloe", "Joseph", "Victoria", "John", "Madison",
+            "David", "Luna", "Wyatt", "Layla"];
+
+        string[] lastNames = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller",
+            "Davis", "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez", "Wilson",
+            "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin", "Lee", "Thompson",
+            "White", "Harris", "Clark", "Lewis", "Robinson", "Walker", "Hall", "Allen",
+            "Young", "King", "Wright", "Scott", "Torres", "Nguyen", "Hill", "Flores",
+            "Green", "Adams", "Nelson", "Baker"];
+
+        var random = new Random(42); // reproducible results
+
+        for (int i = 1; i <= 40; i++)
         {
-            await client.DisconnectAsync();
-            Console.WriteLine("Disconnected cleanly.");
-        }
-        client?.Dispose();
-    }
+            var fn = firstNames[(i - 1) % firstNames.Length];
+            var ln = lastNames[(i - 1) % lastNames.Length];
 
-    private static async Task PublishLoop()
-    {
-        int counter = 0;
-
-        while (keepRunning)
-        {
-            counter++;
-            Console.WriteLine($"[#{counter}] Sending update...");
-            await SendData();
-
-            try
+            people.Add(new Person
             {
-                await Task.Delay(5000, CancellationToken.None);
+                Id = i,
+                FirstName = fn,
+                LastName = ln,
+                Email = $"{fn.ToLower()}.{ln.ToLower()}@techcorp.com",
+                Age = random.Next(22, 65),
+                IsActive = random.NextDouble() > 0.3
+            });
+        }
+
+        var payload = JsonSerializer.Serialize(people);
+        var message = new MqttApplicationMessageBuilder()
+            .WithTopic("app/people/data")
+            .WithPayload(payload)
+            .WithQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.AtLeastOnce)
+            .Build();
+
+        await client!.PublishAsync(message);
+
+        Console.WriteLine($"Sent {people.Count} people ({payload.Length / 1024.0:F1} KB)");
+        Console.WriteLine($"  Example: {people[0].FirstName} {people[0].LastName} ({people[0].Email})");
+    }
+
+    private static async Task UpdateLoopAsync()
+    {
+        await Task.Delay(2000); // little warm-up delay
+
+        int batchCount = 0;
+        while (running)
+        {
+            batchCount++;
+            Console.WriteLine($"\nBatch #{batchCount}");
+
+            int updatesThisBatch = Random.Shared.Next(3, 6);
+            for (int i = 0; i < updatesThisBatch; i++)
+            {
+                await SendRandomUpdate();
+                await Task.Delay(100);
             }
-            catch (TaskCanceledException) { }
+
+            await Task.Delay(2000); // ~2s between batches
         }
     }
 
-    private static async Task SendData()
+    private static async Task SendRandomUpdate()
     {
-        if (client?.IsConnected != true)
-        {
-            Console.WriteLine("Not connected - skipping publish");
-            return;
-        }
+        if (client?.IsConnected != true) return;
 
         try
         {
-            var people = GenerateRandomPeople(80 + Random.Shared.Next(40)); // 80–120 people
-            var payload = JsonSerializer.Serialize(people, new JsonSerializerOptions { WriteIndented = false });
+            var rnd = Random.Shared;
+            int id = rnd.Next(1, 41);
+
+            var update = new PersonUpdate
+            {
+                Id = id,
+                Age = rnd.Next(22, 65),
+                IsActive = rnd.NextDouble() > 0.35
+            };
+
+            var payload = JsonSerializer.Serialize(update);
 
             var msg = new MqttApplicationMessageBuilder()
-                .WithTopic("app/people/data")
+                .WithTopic("app/people/update")
                 .WithPayload(payload)
                 .WithQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.AtLeastOnce)
                 .Build();
 
             await client.PublishAsync(msg);
 
-            Console.WriteLine($"Sent {people.Count} records  ({payload.Length / 1024:F1} kB)  {DateTime.Now:HH:mm:ss}");
+            var person = people.Find(p => p.Id == id);
+            string name = person != null ? $"{person.FirstName} {person.LastName}" : $"#{id}";
+
+            Console.WriteLine($"  → {name,-18}  age: {update.Age,-2}  {(update.IsActive ? "✓" : "✗")}");
         }
         catch (Exception ex)
         {
@@ -137,32 +183,13 @@ class Program
         }
     }
 
-    private static List<Person> GenerateRandomPeople(int count)
+    private static async Task Cleanup()
     {
-        var list = new List<Person>(count);
-        var rnd = Random.Shared;
-
-        string[] first = ["James", "Emma", "Liam", "Olivia", "Noah", "Ava", "Ethan", "Sophia", "Lucas", "Mia",
-                          "Alexander", "Charlotte", "Benjamin", "Amelia", "William", "Harper", "Michael", "Evelyn"];
-        string[] last = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez",
-                         "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", "Thomas", "Taylor", "Moore"];
-
-        for (int i = 1; i <= count; i++)
+        if (client?.IsConnected == true)
         {
-            var fn = first[rnd.Next(first.Length)];
-            var ln = last[rnd.Next(last.Length)];
-
-            list.Add(new Person
-            {
-                Id = i,
-                FirstName = fn,
-                LastName = ln,
-                Email = $"{fn.ToLower()}.{ln.ToLower()}{i}@mail.example.com",
-                Age = rnd.Next(19, 68),
-                IsActive = rnd.NextDouble() > 0.35
-            });
+            await client.DisconnectAsync();
+            Console.WriteLine("Disconnected cleanly");
         }
-
-        return list;
+        client?.Dispose();
     }
 }
